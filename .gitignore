@@ -1,0 +1,10 @@
+# Environment variables — never commit real credentials
+.env
+
+# Playwright output
+test-results/
+playwright-report/
+auth/
+
+# Node modules
+node_modules/

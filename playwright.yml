@@ -1,0 +1,212 @@
+name: Gmail Login - Playwright Tests
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  schedule:
+    # Run every day at 6:00 AM IST (00:30 UTC)
+    - cron: '30 0 * * *'
+  workflow_dispatch:
+    # Allow manual trigger from GitHub UI
+    inputs:
+      browser:
+        description: 'Browser to run tests on'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - all
+          - Chrome
+          - Firefox
+          - Safari
+          - Edge
+
+# ─────────────────────────────────────────────
+# Permissions
+# ─────────────────────────────────────────────
+permissions:
+  contents: read
+  checks: write
+  pull-requests: write
+
+# ─────────────────────────────────────────────
+# Cancel in-progress runs on new push
+# ─────────────────────────────────────────────
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  # ───────────────────────────────────────────
+  # Job 1: Run Playwright Tests
+  # ───────────────────────────────────────────
+  playwright-tests:
+    name: Playwright Tests (${{ matrix.browser }})
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [Chrome, Firefox, Safari]
+
+    steps:
+
+      # ── Step 1: Checkout Code ──────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Step 2: Setup Node.js ──────────────
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      # ── Step 3: Install Dependencies ───────
+      - name: Install dependencies
+        run: npm ci
+
+      # ── Step 4: Install Playwright Browsers─
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps ${{ matrix.browser == 'Chrome' && 'chromium' || matrix.browser == 'Firefox' && 'firefox' || 'webkit' }}
+
+      # ── Step 5: Create .env from Secrets ───
+      - name: Create .env file from GitHub Secrets
+        run: |
+          cat <<EOF > .env
+          VALID_EMAIL=${{ secrets.VALID_EMAIL }}
+          VALID_PASSWORD=${{ secrets.VALID_PASSWORD }}
+          INVALID_EMAIL=${{ secrets.INVALID_EMAIL || 'userexample.com' }}
+          NON_EXIST_EMAIL=${{ secrets.NON_EXIST_EMAIL || 'nonexistent12345xyz@gmail.com' }}
+          WRONG_PASSWORD=${{ secrets.WRONG_PASSWORD || 'WrongPassword@999' }}
+          SMS_OTP=${{ secrets.SMS_OTP || '000000' }}
+          TOTP_CODE=${{ secrets.TOTP_CODE || '000000' }}
+          AUTH_STATE_PATH=auth/storageState.json
+          HEADLESS=true
+          BASE_URL=https://gmail.com
+          CI=true
+          EOF
+
+      # ── Step 6: Create Auth Directory ──────
+      - name: Create auth directory
+        run: mkdir -p auth test-results playwright-report
+
+      # ── Step 7: Run Playwright Tests ────────
+      - name: Run Playwright tests on ${{ matrix.browser }}
+        run: npx playwright test --project="${{ matrix.browser }}"
+        env:
+          CI: true
+
+      # ── Step 8: Upload HTML Report ──────────
+      - name: Upload Playwright HTML report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report-${{ matrix.browser }}
+          path: playwright-report/
+          retention-days: 14
+
+      # ── Step 9: Upload Test Results ─────────
+      - name: Upload test results (JSON)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results-${{ matrix.browser }}
+          path: test-results/
+          retention-days: 14
+
+      # ── Step 10: Upload Failure Screenshots ─
+      - name: Upload failure screenshots
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: failure-screenshots-${{ matrix.browser }}
+          path: test-results/**/*.png
+          retention-days: 7
+
+      # ── Step 11: Upload Failure Videos ──────
+      - name: Upload failure videos
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: failure-videos-${{ matrix.browser }}
+          path: test-results/**/*.webm
+          retention-days: 7
+
+  # ───────────────────────────────────────────
+  # Job 2: Merge & Publish Report Summary
+  # ───────────────────────────────────────────
+  report-summary:
+    name: Publish Test Report Summary
+    runs-on: ubuntu-latest
+    needs: playwright-tests
+    if: always()
+
+    steps:
+
+      # ── Step 1: Checkout ───────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Step 2: Download All Reports ───────
+      - name: Download all reports
+        uses: actions/download-artifact@v4
+        with:
+          path: all-reports/
+
+      # ── Step 3: Post Summary to PR ─────────
+      - name: Post test summary to GitHub
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            let summary = '## 🎭 Playwright Test Results\n\n';
+            summary += '| Browser | Status |\n|---|---|\n';
+
+            const browsers = ['Chrome', 'Firefox', 'Safari'];
+            for (const browser of browsers) {
+              const resultPath = `all-reports/test-results-${browser}/results.json`;
+              if (fs.existsSync(resultPath)) {
+                const data = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+                const passed = data.stats?.expected ?? 0;
+                const failed = data.stats?.unexpected ?? 0;
+                const skipped = data.stats?.skipped ?? 0;
+                const status = failed === 0 ? '✅ Pass' : '❌ Fail';
+                summary += `| ${browser} | ${status} (${passed} passed, ${failed} failed, ${skipped} skipped) |\n`;
+              } else {
+                summary += `| ${browser} | ⚠️ No results found |\n`;
+              }
+            }
+
+            summary += '\n> 📎 Full HTML reports available in [Actions Artifacts](' +
+              `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: summary
+            });
+
+      # ── Step 4: Write Job Summary ──────────
+      - name: Write GitHub Actions job summary
+        run: |
+          echo "## 🎭 Playwright Gmail Login Test Run" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Triggered by | ${{ github.event_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Branch | ${{ github.ref_name }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | ${{ github.sha }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Browsers | Chrome, Firefox, Safari |" >> $GITHUB_STEP_SUMMARY
+          echo "| Reports | Available in Artifacts |" >> $GITHUB_STEP_SUMMARY
